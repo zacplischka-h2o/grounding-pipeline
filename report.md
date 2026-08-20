@@ -150,7 +150,8 @@ FPR are printed for transfer and not just AUROC.
 - Gemma's score is the first-token probability of `ungrounded`, normalized against
   `grounded`. No sampling. The LoRA adapter is attached, never merged — merging shifts that
   ratio. A dead two-way distribution stops the run rather than being rescued into noise.
-- One `MODEL_ID` (`unsloth/gemma-4-E2B-it`, 4-bit) for training and for both eval rows.
+- One `MODEL_ID` (`unsloth/gemma-4-E2B-it`, bf16 on an A100) for training and for both
+  eval rows. Precision is shared so no part of the lift can come from the weights.
 - Reproduce: `python prep.py`, then
   `python evaluate.py {script,writer-prior,answer-only,gemma,gemma-ft}`, then
   `python evaluate.py report`.

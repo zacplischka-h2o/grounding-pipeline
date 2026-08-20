@@ -21,3 +21,17 @@ its readout records that the run actually happened on Colab.
 This becomes wrong if no GPU is reachable. Then go local and carry four mitigations: pin
 `--max-seq-length 4096`, use `completion` rather than `chat` dataset format, confirm the
 loss is not NaN at iteration 1, and never merge the adapter.
+
+## Amendment (2026-08-21): A100 available, so bf16 not 4-bit
+
+The run has a Colab Pro A100. `LOAD_IN_4BIT = False`: 40GB has room for bf16 weights and
+the hardware bf16 path, so there is no reason to accept quantization loss. The rule that
+matters is unchanged — training and **both** eval rows share one `MODEL_ID` and one
+precision setting, because a mismatch would put part of the measured lift in the weights
+rather than in the fine-tune. Real batches of 4 replace 16 accumulation steps at the same
+effective batch size.
+
+`TRAIN_ROWS` stays at 1,000. It was never a hardware budget; it is the pre-registered first
+shot, and PLAN.md's rule already allows scaling to the full 4,335 if the lift comes up
+short. On an A100 that second run is cheap — but it is a response to a result, not a
+pre-emptive change.

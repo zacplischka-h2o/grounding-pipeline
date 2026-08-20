@@ -1,7 +1,8 @@
 """LoRA fine-tune Gemma 4 E2B as a groundedness Classifier, and score with it.
 
 Needs a CUDA GPU. See docs/adr/0003-train-on-unsloth-not-local-mlx.md for why this is
-not local MLX. Colab T4 is enough (Unsloth reports E2B LoRA at 8-10 GB).
+not local MLX. Tuned for an A100: bf16 weights, real batches. On a T4 or any GPU under
+~24GB, set LOAD_IN_4BIT = True and per_device_train_batch_size = 1 (accumulation 16).
 
     pip install unsloth
     python train.py                 # train, save adapter to models/gemma-ft
@@ -17,9 +18,13 @@ import json
 import random
 from pathlib import Path
 
-# One id for training and for both eval rows. Prequantized 4-bit, never merged.
+# One id for training and for both eval rows. The adapter is never merged.
 MODEL_ID = "unsloth/gemma-4-E2B-it"
-LOAD_IN_4BIT = True
+# bf16, not 4-bit: an A100 has the memory and the hardware bf16 path, so there is no
+# reason to eat quantization loss. What matters is that training and BOTH eval rows
+# use the same setting — a mismatch would put part of the measured lift in the
+# weights rather than the fine-tune. Set True if running on a smaller GPU.
+LOAD_IN_4BIT = False
 MAX_SEQ = 8192  # 128K-context model; a lower cap only risks silent truncation
 ADAPTER = Path("models/gemma-ft")
 TRAIN_ROWS = 1000
@@ -58,7 +63,7 @@ def _prompt_text(tok, prompt):
     ))
 
 
-def first_token_scores(prompts, adapter=None, batch_size=8):
+def first_token_scores(prompts, adapter=None, batch_size=16):
     """P(ungrounded) at the first generated position, for each prompt.
 
     A real two-way distribution: no sampling, no generation. Returns the normalized
@@ -151,8 +156,10 @@ def main():
             dataset_text_field="text",
             max_length=MAX_SEQ,  # TRL defaults to 1024 and truncates from the RIGHT,
             # which would cut off the answer word — the only supervised token.
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=16,
+            # Effective batch stays 16. On 40GB, 4x1 real batches beat 16 accumulation
+            # steps by roughly 3x wall clock.
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=4,
             num_train_epochs=2,
             learning_rate=2e-4,
             warmup_ratio=0.03,

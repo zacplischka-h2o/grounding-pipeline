@@ -45,7 +45,7 @@ Response alone, digits deleted, scored **AUROC 0.989** on its test split
 - **Training**: LoRA on a CUDA GPU via Unsloth, not local MLX
   ([ADR 0003](docs/adr/0003-train-on-unsloth-not-local-mlx.md)). `r=8`, `alpha=8`,
   `dropout=0`, `target_modules="all-linear"`, `lr=2e-4` cosine, 2 epochs, effective batch
-  16, `max_seq_length=8192`. 1,000 rows first; scale to 4,335 only if the lift is short.
+  16, `max_seq_length=8192`, bf16 on an A100. 1,000 rows first; scale to 4,335 only if the lift is short.
 - **Supervision**: completion-only, via Gemma 4's `<|turn>user\n` / `<|turn>model\n`
   markers. The supervised span is asserted to be the answer word plus terminator before
   training starts.
