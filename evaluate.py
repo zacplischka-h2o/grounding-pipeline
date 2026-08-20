@@ -3,6 +3,7 @@
     python evaluate.py script          # number-membership floor, no model  (ADR 0005)
     python evaluate.py writer-prior    # per-writer base rate, no text      (ADR 0008)
     python evaluate.py answer-only     # response text only, no evidence    (ADR 0006)
+    python evaluate.py judge           # the incumbent LLM judge, via the Anthropic API
     python evaluate.py gemma           # off-the-shelf Gemma 4 E2B
     python evaluate.py gemma-ft        # + LoRA adapter
     python evaluate.py report          # print the tables from saved scores
@@ -18,8 +19,10 @@ comparisons — needs them, and the GPU session that produced them will be gone.
 
 import collections
 import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +31,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 DATA = Path("data")
 SCORES = Path("data/scores")
 TARGET_FPR = 0.05
+JUDGE_MODEL = "claude-opus-5"
+JUDGE_WORKERS = 12
 BOOTSTRAP = 2000
 SEED = 17
 
@@ -114,6 +119,56 @@ def score_answer_only(train, rows):
     return model.predict_proba(vec.transform([strip(r["response"]) for r in rows]))[:, 1]
 
 
+def score_judge(train, rows):
+    """The incumbent Judge: one API call per Record, one word back.
+
+    Binary by nature — a real gate returns a Verdict, not a score. So its "AUROC" is
+    balanced accuracy, it needs no dev threshold, and it sits in the table as a
+    reference point rather than as a bar.
+    """
+    del train
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    import anthropic
+    from prep import render
+
+    for line in open(".env"):
+        k, _, v = line.strip().partition("=")
+        if k == "ANTHROPIC_API_KEY":
+            os.environ.setdefault(k, v.strip().strip("\"'"))
+    client = anthropic.Anthropic()
+
+    def one(record):
+        for attempt in range(4):
+            try:
+                m = client.messages.create(
+                    model=JUDGE_MODEL, max_tokens=2048,
+                    messages=[{"role": "user", "content": render(record)}],
+                )
+                text = " ".join(b.text for b in m.content if b.type == "text").lower()
+                # 'ungrounded' contains 'grounded', so test for it first.
+                if "ungrounded" in text:
+                    return 1.0
+                if "grounded" in text:
+                    return 0.0
+                return float("nan")
+            except anthropic.APIStatusError as e:
+                if e.status_code < 500 and e.status_code != 429:
+                    raise
+            except anthropic.APIConnectionError:
+                pass
+            time.sleep(2 ** attempt)
+        return float("nan")
+
+    with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
+        scores = list(pool.map(one, rows))
+    bad = sum(1 for v in scores if v != v)
+    if bad:
+        print(f"  judge: {bad}/{len(rows)} records gave no usable verdict; scored 0.5")
+    return np.array([0.5 if v != v else v for v in scores])
+
+
 def score_gemma(train, rows, adapter=None):
     """P(ungrounded) from the first generated token. See train.py for the recipe."""
     del train
@@ -123,10 +178,14 @@ def score_gemma(train, rows, adapter=None):
     return first_token_scores([render(r) for r in rows], adapter=adapter)
 
 
+# Candidates that emit a Verdict, not a score: threshold is 0.5 and dev is not scored.
+BINARY = {"judge"}
+
 CANDIDATES = {
     "script": score_script,
     "writer-prior": score_writer_prior,
     "answer-only": score_answer_only,
+    "judge": score_judge,
     "gemma": score_gemma,
     "gemma-ft": lambda tr, rows: score_gemma(tr, rows, adapter="models/gemma-ft"),
 }
@@ -193,12 +252,20 @@ def run(name):
     out = {"threshold": None, "splits": {}, "by_model": {}, "by_task": {}, "scores": {}}
     dev, test = load("dev"), load("test")
 
-    dev_s = CANDIDATES[name](train, dev)
-    out["threshold"] = freeze_threshold(dev_s, y(dev))
-    out["splits"]["dev"] = measure(dev_s, y(dev), out["threshold"])
-    out["scores"]["dev"] = dev_s.tolist()
+    if name in BINARY:
+        out["threshold"] = 0.5  # a Verdict has no threshold to tune
+    else:
+        dev_s = CANDIDATES[name](train, dev)
+        out["threshold"] = freeze_threshold(dev_s, y(dev))
+        out["splits"]["dev"] = measure(dev_s, y(dev), out["threshold"])
+        out["scores"]["dev"] = dev_s.tolist()
 
-    for split, rows in [("test", test), ("transfer", load("transfer"))]:
+    # The judge costs real money per Record, so transfer (1,775 rows, ~2x the test
+    # split) is opt-in: JUDGE_TRANSFER=1. Every free candidate always scores both.
+    splits = [("test", test)]
+    if name not in BINARY or os.environ.get("JUDGE_TRANSFER"):
+        splits.append(("transfer", load("transfer")))
+    for split, rows in splits:
         s = CANDIDATES[name](train, rows)
         out["scores"][split] = s.tolist()
         out["splits"][split] = measure(s, y(rows), out["threshold"])

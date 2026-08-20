@@ -17,9 +17,11 @@ shelf, at deciding whether an answer is grounded in its evidence?
   ([ADR 0007](docs/adr/0007-this-repo-measures-factual-statements-only.md)).
 - **Prevalence is inverted.** This corpus is 64% ungrounded; production is almost certainly
   mostly grounded. AUROC and recall-at-fixed-FPR carry over. **Precision does not.**
-- **No Judge row.** The incumbent LLM judge is not scored on these rows, so this report
-  cannot say whether a small model is good enough to replace it. It says only what
-  fine-tuning adds.
+- **The Judge row is a strong reference, not your production gate.** It is Claude Opus 5
+  reading the same prompt, not whatever model Commonwealth Bank actually runs. It answers
+  "how close is a small model to a good LLM judge", not "can it replace ours".
+- **The Judge was not scored on transfer.** That split is 1,775 Records and would have cost
+  a further $19. Its transfer cells are blank, not zero.
 - **n = 900 test**, and n ≈ 150 per writer model — a single per-writer cell carries a 95%
   interval of roughly ±0.11.
 
@@ -70,6 +72,7 @@ adds little" — a real answer.
 | `script` | 0.588 | 0.557–0.620 | 0.016 | 0.003 | 0.513 | 0.102 | 0.048 |
 | `writer-prior` | 0.828 | 0.800–0.857 | 0.238 | 0.037 | 0.695 | 0.190 | 0.164 |
 | `answer-only` | 0.835 | 0.803–0.866 | 0.358 | 0.059 | 0.522 | 0.000 | 0.000 |
+| `judge` (Claude Opus 5) | 0.849 | 0.827–0.872 | 0.964 | 0.265 | — | — | — |
 | `gemma` | _pending_ | | | | | | |
 | `gemma-ft` | _pending_ | | | | | | |
 
@@ -80,6 +83,7 @@ adds little" — a real answer.
 | `script` | 0.541 | 0.494 | 0.570 | 0.493 | 0.547 | 0.636 | **0.547** |
 | `writer-prior` | 0.500 | 0.500 | 0.500 | 0.500 | 0.500 | 0.500 | **0.500** |
 | `answer-only` | 0.561 | 0.562 | 0.660 | 0.565 | 0.630 | 0.689 | **0.611** |
+| `judge` | 0.821 | 0.895 | 0.583 | 0.667 | 0.669 | 0.618 | **0.709** |
 
 ### Transfer AUROC by task type
 
@@ -88,6 +92,7 @@ adds little" — a real answer.
 | `script` | 0.497 | 0.526 |
 | `writer-prior` | 0.669 | 0.718 |
 | `answer-only` | 0.583 | 0.505 |
+| `judge` | — | — |
 
 ---
 
@@ -106,6 +111,31 @@ free of writer identity, and `answer-only`'s mean of 0.611 is the real shortcut 
 mostly invented facts, attributes and sentiment rather than wrong figures, so number
 checking cannot find them. It abstains (0.5) on 118 of 900 test rows that contain no number.
 Good: the floor is low and honest, and there is real work left for a model.
+
+**The Judge reads the Evidence, and it shows.** Its per-writer-model mean is **0.709**
+against `answer-only`'s 0.611. That column is free of writer identity by construction, so
+0.709 is what a strong LLM judge earns by actually reading. It is the number `gemma-ft`
+should be measured against in spirit — but the pre-registered bar stays at 0.611, because
+moving a bar after seeing data is the thing pre-registration exists to prevent.
+
+**The Judge runs hot.** It flags 96.4% of ungrounded Responses, and also 26.5% of grounded
+ones. Every other row is pinned at FPR <= 5%, so the AUROC column is the only fair
+comparison. At the Judge's own operating point:
+
+| Candidate | recall at FPR = 0.265 |
+|---|---|
+| `script` | 0.392 |
+| `writer-prior` | 0.682 |
+| `answer-only` | 0.845 |
+| **`judge`** | **0.964** |
+
+Reading the Evidence buys about **+0.12 recall** over the best shortcut, at the same false
+alarm rate. That gap is the size of the prize this experiment is chasing.
+
+**The Judge is weakest where the writers lie most.** It scores 0.895 on gpt-4 and 0.821 on
+gpt-3.5-turbo — the writers that rarely hallucinate — but only 0.583 on llama-2-13b, which
+hallucinates 96% of the time. Catching a rare error is a different problem from catching a
+common one, and the production case is the rare one.
 
 **`answer-only` fires on nothing in transfer.** Recall 0.000 at FPR 0.000. The dev-frozen
 threshold does not survive the prevalence drop from 0.643 to 0.205. This is why recall and
