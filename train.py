@@ -46,10 +46,16 @@ def _load(adapter=None):
     return model, tok
 
 
+def _strip_bos(tok, text):
+    """apply_chat_template emits <bos>; the tokenizer adds another. Unsloth's Gemma 4
+    guide says to remove it."""
+    return text.removeprefix(tok.bos_token) if tok.bos_token else text
+
+
 def _prompt_text(tok, prompt):
-    return tok.apply_chat_template(
+    return _strip_bos(tok, tok.apply_chat_template(
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-    )
+    ))
 
 
 def first_token_scores(prompts, adapter=None, batch_size=8):
@@ -72,10 +78,15 @@ def first_token_scores(prompts, adapter=None, batch_size=8):
                 ids.add(t[0])
         return sorted(ids)
 
+    for w in ("grounded", "ungrounded"):
+        assert len(tok.encode(w, add_special_tokens=False)) == 1, (
+            f"{w!r} is not a single token under this tokenizer. If 'ungrounded' splits "
+            f"as 'un' + 'grounded', its first-token mass absorbs every word starting "
+            f"'un' — 'Unfortunately', 'Unless', 'Under' — and the readout is noise."
+        )
     g_ids, u_ids = variants("grounded"), variants("ungrounded")
     assert not (set(g_ids) & set(u_ids)), (
-        "'grounded' and 'ungrounded' share a first token under this tokenizer; "
-        "the readout cannot separate them"
+        "'grounded' and 'ungrounded' share a first token under this tokenizer"
     )
 
     out = []
@@ -88,10 +99,16 @@ def first_token_scores(prompts, adapter=None, batch_size=8):
         probs = torch.softmax(logits, dim=-1)
         pg = probs[:, g_ids].sum(-1)
         pu = probs[:, u_ids].sum(-1)
-        out.extend((pu / (pg + pu).clamp(min=1e-9)).cpu().tolist())
-        if i == 0:
-            print(f"  first batch: P(grounded)+P(ungrounded) = {(pg + pu).mean():.4f} "
-                  "(near 0 means the prompt was truncated)")
+        # A dead two-way distribution divided by a clamp yields a well-behaved number
+        # in [0,1] that is pure logit noise, and reads as "weak model" not "broken
+        # readout". Stop instead. Checked on every batch: a degenerate minority is
+        # invisible in a batch mean.
+        assert float((pg + pu).min()) > 1e-4, (
+            f"readout dead on a row in batch {i // batch_size}: "
+            f"P(grounded)+P(ungrounded) = {float((pg + pu).min()):.2e}. "
+            "The prompt was truncated, or the model is not answering with one word."
+        )
+        out.extend((pu / (pg + pu)).cpu().tolist())
     return np.array(out)
 
 
@@ -103,11 +120,11 @@ def build_dataset(tok):
     random.Random(SEED).shuffle(rows)
     rows = rows[:TRAIN_ROWS]
     texts = [
-        tok.apply_chat_template(
+        _strip_bos(tok, tok.apply_chat_template(
             [{"role": "user", "content": render(r)},
              {"role": "assistant", "content": r["label"]}],
             tokenize=False,
-        )
+        ))
         for r in rows
     ]
     print(f"training rows: {len(texts)}  "
@@ -132,6 +149,8 @@ def main():
         train_dataset=build_dataset(tok),
         args=SFTConfig(
             dataset_text_field="text",
+            max_length=MAX_SEQ,  # TRL defaults to 1024 and truncates from the RIGHT,
+            # which would cut off the answer word — the only supervised token.
             per_device_train_batch_size=1,
             gradient_accumulation_steps=16,
             num_train_epochs=2,
@@ -163,12 +182,18 @@ def main():
 
     # Prove the mask is right before spending a GPU hour: what survives must be
     # exactly the answer word plus the turn terminator.
-    row = trainer.train_dataset[0]
-    kept = tok.decode([t for t, l in zip(row["input_ids"], row["labels"]) if l != -100])
-    print(f"supervised tokens of row 0: {kept!r}")
-    assert "grounded" in kept and len(kept) < 40, (
-        f"completion-only masking is wrong; supervising {len(kept)} chars: {kept!r}"
-    )
+    # Check the LONGEST row, not row 0: a short row passes even when the cap is
+    # truncating the answer word off every long one.
+    ds = trainer.train_dataset
+    longest = max(range(len(ds)), key=lambda i: len(ds[i]["input_ids"]))
+    for tag, i in [("row 0", 0), ("longest row", longest)]:
+        row = ds[i]
+        kept = tok.decode([t for t, l in zip(row["input_ids"], row["labels"]) if l != -100])
+        print(f"supervised tokens of {tag} ({len(row['input_ids'])} tok): {kept!r}")
+        assert "grounded" in kept and len(kept) < 40, (
+            f"completion-only masking is wrong on {tag}; supervising "
+            f"{len(kept)} chars: {kept!r}"
+        )
 
     trainer.train()
     ADAPTER.parent.mkdir(parents=True, exist_ok=True)

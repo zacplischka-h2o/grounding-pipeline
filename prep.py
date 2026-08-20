@@ -39,8 +39,15 @@ grounded or ungrounded."""
 
 
 def render(record):
-    """Record -> the exact prompt string the model sees. The only renderer."""
-    return JUDGE_PROMPT % (json.dumps(record["evidence"], indent=2), record["response"])
+    """Record -> the exact prompt string the model sees. The only renderer.
+
+    Evidence is a dict for Data2txt and QA, but a plain string for Summary. Passing a
+    string through json.dumps would deliver a quote-wrapped, backslash-escaped
+    one-liner unlike anything the model trained on.
+    """
+    ev = record["evidence"]
+    ev = ev if isinstance(ev, str) else json.dumps(ev, indent=2)
+    return JUDGE_PROMPT % (ev, record["response"])
 
 
 def fetch():

@@ -63,6 +63,7 @@ Four candidates, all emitting one score in [0,1] per Record.
 
 | Row | What it is | Why it is there |
 |---|---|---|
+| `writer-prior` | The writing model's base rate, no text | The identity floor ([ADR 0008](docs/adr/0008-the-bars-are-set-against-the-writer-prior.md)) |
 | `script` | Number membership, no model | The deterministic floor ([ADR 0005](docs/adr/0005-script-only-baseline-runs-before-any-training.md)) |
 | `answer-only` | Bag of words over the Response, Evidence blanked, digits stripped | The shortcut floor ([ADR 0006](docs/adr/0006-ragtruth-data2txt-replaces-the-synthetic-corpus.md)) |
 | `gemma` | Off the shelf | The before |
@@ -72,29 +73,28 @@ Columns: test AUROC, test recall at the dev-frozen threshold, realized test FPR,
 AUROC. Plus a per-writer-model breakdown, because pooled numbers are inflated by writer
 identity.
 
-## The bars, pre-registered
+## The bars
 
-Written into `report.md` before the model ran, so no outcome can be read as a pass after
-the fact.
+Set against the **writer-prior** baseline — six numbers, no text, no Evidence — which
+scores test AUROC 0.828 and transfer 0.695. Any bar below that is clearable by a lookup
+table. Stated in full in [`report.md`](report.md) and
+[ADR 0008](docs/adr/0008-the-bars-are-set-against-the-writer-prior.md). Every comparison is
+a paired cluster-bootstrap interval over `source_id`, never two point estimates.
 
-| Bar | Value |
-|---|---|
-| Beat the answer-only floor on test AUROC | > 0.835 |
-| Beat the answer-only floor per writer model | > 0.61 mean |
-| Show something on the transfer set | > 0.55 AUROC |
-| Fine-tuned beats off-the-shelf | McNemar p < 0.05 on paired test decisions |
-
-Clearing the first three but missing the fourth reads as "Gemma 4 E2B is already competent
-and fine-tuning adds little" — a real answer, not a failure.
+**Stop rule: one training run at 1,000 rows. A missed bar is reported as a missed bar, not
+retuned.** The prior prototype died of open-ended tuning; this is the line that prevents a
+repeat.
 
 ## Order of work
 
 1. `prep.py` — fetch RAGTruth, build the four splits. **Done.**
-2. `evaluate.py script` — the deterministic floor. **Done: test AUROC 0.524.**
-3. `evaluate.py answer-only` — the shortcut floor. **Done: test AUROC 0.835, transfer 0.522.**
-4. `train.py` — LoRA, 1,000 rows, on Colab. **Pending.**
-5. `evaluate.py gemma` and `evaluate.py gemma-ft`. **Pending.**
-6. `evaluate.py report` → fill `report.md`, add McNemar. **Pending.**
+2. `evaluate.py script` — the deterministic floor. **Done: test AUROC 0.588.**
+3. `evaluate.py writer-prior` — the identity floor. **Done: test AUROC 0.828, transfer 0.695.**
+4. `evaluate.py answer-only` — the shortcut floor. **Done: test AUROC 0.835, transfer 0.522.**
+5. `evaluate.py gemma` on 20 dev rows as a go/no-go, before renting a GPU for the full run.
+6. `train.py` — LoRA, 1,000 rows, on Colab. **Pending.**
+7. `evaluate.py gemma` and `evaluate.py gemma-ft`, full splits. **Pending.**
+8. `evaluate.py report` → paste into `report.md`. **Pending.**
 
 ## Files
 
@@ -104,19 +104,11 @@ is no shared module.
 
 ## Known limits
 
-- **Not banking.** Evidence is business and review data. No number here transfers to
-  Commonwealth Bank as an accuracy estimate.
-- **Class 1 only.** Capability claims and clarifying questions cannot appear in RAGTruth.
-- **Writer identity is a confound.** Ungrounded rates run 0.263 (gpt-3.5-turbo) to 0.952
-  (llama-2-13b), so recognising the writer half-answers the question. Mitigated by the
-  per-model breakdown, not eliminated.
-- **Prevalence.** The corpus is ~64% ungrounded; production is almost certainly mostly
-  grounded. AUROC and recall-at-fixed-FPR carry over; precision does not.
-- **n = 900 test.** Enough to detect a ΔAUC around 0.10, not 0.02.
+Stated in [`report.md`](report.md), in the deliverable rather than the plan.
 
 ## What would make this wrong
 
-- The supervised span assert fires → completion-only masking is broken.
-- `P(grounded)+P(ungrounded)` near zero → the prompt truncated and the readout is 0.5.
+- The supervised span assert fires on the longest row → the sequence cap is truncating the answer word.
+- The readout assert fires → the prompt truncated, or the model is not answering in one word.
 - `gemma-ft` beats `gemma` on test but not on transfer → the lift is corpus-specific.
-- `gemma-ft` fails to beat `answer-only` per writer model → it learned writer identity.
+- `gemma-ft` fails to beat 0.611 per writer model → it learned writer identity, not grounding.

@@ -61,21 +61,18 @@ _Avoid_: baseline, guardrail, gate
 **Classifier**:
 The fine-tuned small model under test. The candidate replacement for the Judge.
 
-**Negative channel**:
-How an ungrounded Record was minted: `minimal-edit` (one small targeted change to a
-verified-grounded Response) or `organic` (generated naturally, then labelled).
-
-**Contrast pair**:
-A grounded Response and its `minimal-edit` negative. The two differ by a few characters, so
-scoring both is the strict test of whether the Classifier reads the evidence or the edit.
-
 **Answer-only baseline**:
 The Classifier scored with the Evidence blanked out. If it still separates the classes, the
 dataset is cheatable and the headline number means nothing.
 
 **Transfer check**:
-An outside dataset, never trained on and never tuned against, read once at the end. It
-answers whether a capability learned on synthetic data is real. RAGTruth plays this role.
+Held-out Records of a different shape, never trained on and never tuned against, read once
+at the end. RAGTruth's `QA` and `Summary` task types play this role.
+
+**Writer-prior**:
+The baseline that scores a Response by the base rate of the model that wrote it — six
+numbers, no text, no Evidence. It scores test AUROC 0.828, so it is the reference every
+bar is set against ([ADR 0008](docs/adr/0008-the-bars-are-set-against-the-writer-prior.md)).
 
 ## ADRs
 
@@ -86,3 +83,4 @@ answers whether a capability learned on synthetic data is real. RAGTruth plays t
 - [0005 — Script-only baseline runs first](docs/adr/0005-script-only-baseline-runs-before-any-training.md)
 - [0006 — RAGTruth Data2txt replaces the synthetic corpus](docs/adr/0006-ragtruth-data2txt-replaces-the-synthetic-corpus.md)
 - [0007 — This repo measures factual statements only](docs/adr/0007-this-repo-measures-factual-statements-only.md)
+- [0008 — The bars are set against the writer-prior](docs/adr/0008-the-bars-are-set-against-the-writer-prior.md)

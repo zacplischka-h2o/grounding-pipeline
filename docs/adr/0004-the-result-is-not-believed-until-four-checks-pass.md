@@ -34,3 +34,9 @@ about the generator.
 > **Status (2026-08-20): the stop condition fired.** A response-text-only classifier
 > reaches test AUROC 0.989 with all digits removed. See
 > [the style-separability note](../research/2026-08-20-the-corpus-is-style-separable.md).
+
+> **Superseded in part (2026-08-20).** Checks 2 (contrast-consistency) and 3 (per-negative
+> channel) do not apply to RAGTruth, which has no minted negatives — see
+> [ADR 0006](0006-ragtruth-data2txt-replaces-the-synthetic-corpus.md). Check 1
+> (answer-only) is now a permanent table row, joined by a writer-prior row, and the bars
+> are restated in [ADR 0008](0008-the-bars-are-set-against-the-writer-prior.md).

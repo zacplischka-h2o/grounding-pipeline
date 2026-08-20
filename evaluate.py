@@ -1,16 +1,22 @@
 """Score candidates on dev and test, freeze the threshold on dev, report.
 
     python evaluate.py script          # number-membership floor, no model  (ADR 0005)
+    python evaluate.py writer-prior    # per-writer base rate, no text      (ADR 0008)
     python evaluate.py answer-only     # response text only, no evidence    (ADR 0006)
     python evaluate.py gemma           # off-the-shelf Gemma 4 E2B
     python evaluate.py gemma-ft        # + LoRA adapter
-    python evaluate.py report          # print the table from saved scores
+    python evaluate.py report          # print the tables from saved scores
 
 Every candidate emits one score in [0,1] per Record: P(ungrounded). Thresholds are
-tuned on dev at FPR <= 5% and applied unchanged to test, so the realized test FPR is
-reported next to recall — a dev-frozen threshold does not hold its FPR.
+tuned on dev at FPR <= 5% and applied unchanged to test and transfer, so the realized
+FPR is reported beside recall — a dev-frozen threshold does not hold its FPR, and on
+transfer (prevalence 0.205 vs test 0.643) it can fire on nothing at all.
+
+Per-row scores are saved. Everything downstream — bootstrap intervals, matched-FPR
+comparisons — needs them, and the GPU session that produced them will be gone.
 """
 
+import collections
 import json
 import re
 import sys
@@ -22,6 +28,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 DATA = Path("data")
 SCORES = Path("data/scores")
 TARGET_FPR = 0.05
+BOOTSTRAP = 2000
+SEED = 17
 
 # ---------------------------------------------------------------- data
 
@@ -43,7 +51,7 @@ def numbers(text):
     """Every number in a string, as absolute floats.
 
     Absolute value matters: evidence stores debits as -18.74 and a response quotes
-    them as $18.74. Signed matching flags ~9% of grounded rows as false positives.
+    them as $18.74. Signed matching flags a chunk of grounded rows as false positives.
     """
     out = set()
     for m in NUM.findall(text):
@@ -55,21 +63,46 @@ def numbers(text):
 
 
 def score_script(train, rows):
-    """Fraction of the response's numbers that are absent from the evidence."""
+    """Fraction of the response's numbers that are absent from the evidence.
+
+    A response with no numbers scores 0.5 — abstain, carrying no rank information.
+    Scoring it 0.0 would rank it as maximally grounded, and number-free responses are
+    *more* likely to be ungrounded than the base rate, so that convention inflated
+    test AUROC and inverted the transfer number.
+    """
     del train
-    scores = []
+    scores, abstained = [], 0
     for r in rows:
-        have = numbers(json.dumps(r["evidence"]))
         want = numbers(r["response"])
-        scores.append(0.0 if not want else len(want - have) / len(want))
+        if not want:
+            scores.append(0.5)
+            abstained += 1
+            continue
+        have = numbers(json.dumps(r["evidence"]))
+        scores.append(len(want - have) / len(want))
+    print(f"  script abstained on {abstained}/{len(rows)} rows with no numbers")
     return np.array(scores)
+
+
+def score_writer_prior(train, rows):
+    """The base rate of the model that wrote the response. Six numbers, no text.
+
+    This exists because it is a strong baseline, not a weak one: writer identity
+    predicts the label well enough to clear a badly-set bar (ADR 0008). Anything
+    claiming to read evidence must beat it.
+    """
+    rate = collections.defaultdict(list)
+    for r in train:
+        rate[r["meta"]["model"]].append(r["label"] == "ungrounded")
+    prior = {m: float(np.mean(v)) for m, v in rate.items()}
+    overall = float(np.mean([r["label"] == "ungrounded" for r in train]))
+    return np.array([prior.get(r["meta"]["model"], overall) for r in rows])
 
 
 def score_answer_only(train, rows):
     """Bag of words over the response alone. The evidence is never seen.
 
-    This is the floor the classifier must beat (ADR 0006). Digits are stripped so a
-    high score cannot be explained by number checking.
+    Digits are stripped so a high score cannot be explained by number checking.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import LogisticRegression
@@ -92,12 +125,18 @@ def score_gemma(train, rows, adapter=None):
 
 CANDIDATES = {
     "script": score_script,
+    "writer-prior": score_writer_prior,
     "answer-only": score_answer_only,
     "gemma": score_gemma,
     "gemma-ft": lambda tr, rows: score_gemma(tr, rows, adapter="models/gemma-ft"),
 }
 
 # ---------------------------------------------------------------- metrics
+
+
+def auroc(labels, scores):
+    """NaN rather than a crash when a slice holds one class."""
+    return float(roc_auc_score(labels, scores)) if 0 < labels.mean() < 1 else float("nan")
 
 
 def freeze_threshold(scores, labels, target=TARGET_FPR):
@@ -112,31 +151,65 @@ def measure(scores, labels, threshold):
     pos, neg = labels == 1, labels == 0
     return {
         "n": int(len(labels)),
-        "auroc": float(roc_auc_score(labels, scores)),
-        "recall": float(flag[pos].mean()),
-        "fpr": float(flag[neg].mean()),
+        "n_pos": int(pos.sum()),
+        "auroc": auroc(labels, scores),
+        "recall": float(flag[pos].mean()) if pos.any() else float("nan"),
+        "fpr": float(flag[neg].mean()) if neg.any() else float("nan"),
     }
+
+
+def boot_auroc_ci(labels, scores, groups):
+    """Cluster bootstrap over source_id. Returns (lo, hi) at 95%."""
+    rng = np.random.default_rng(SEED)
+    by_group = collections.defaultdict(list)
+    for i, g in enumerate(groups):
+        by_group[g].append(i)
+    keys = list(by_group)
+    vals = []
+    for _ in range(BOOTSTRAP):
+        idx = np.concatenate([by_group[keys[k]] for k in rng.integers(0, len(keys), len(keys))])
+        if 0 < labels[idx].mean() < 1:
+            vals.append(roc_auc_score(labels[idx], scores[idx]))
+    return (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))) if vals else (float("nan"),) * 2
+
+
+def boot_delta_ci(labels, a, b, groups):
+    """Paired cluster bootstrap on AUROC(b) - AUROC(a). Same resamples for both."""
+    rng = np.random.default_rng(SEED)
+    by_group = collections.defaultdict(list)
+    for i, g in enumerate(groups):
+        by_group[g].append(i)
+    keys = list(by_group)
+    vals = []
+    for _ in range(BOOTSTRAP):
+        idx = np.concatenate([by_group[keys[k]] for k in rng.integers(0, len(keys), len(keys))])
+        if 0 < labels[idx].mean() < 1:
+            vals.append(roc_auc_score(labels[idx], b[idx]) - roc_auc_score(labels[idx], a[idx]))
+    return (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))) if vals else (float("nan"),) * 2
 
 
 def run(name):
     train = load("train")
-    out = {"threshold": None, "splits": {}, "by_model": {}}
+    out = {"threshold": None, "splits": {}, "by_model": {}, "by_task": {}, "scores": {}}
     dev, test = load("dev"), load("test")
 
     dev_s = CANDIDATES[name](train, dev)
     out["threshold"] = freeze_threshold(dev_s, y(dev))
     out["splits"]["dev"] = measure(dev_s, y(dev), out["threshold"])
+    out["scores"]["dev"] = dev_s.tolist()
 
     for split, rows in [("test", test), ("transfer", load("transfer"))]:
         s = CANDIDATES[name](train, rows)
+        out["scores"][split] = s.tolist()
         out["splits"][split] = measure(s, y(rows), out["threshold"])
-        if split == "test":
-            for m in sorted({r["meta"]["model"] for r in rows}):
-                idx = [i for i, r in enumerate(rows) if r["meta"]["model"] == m]
-                out["by_model"][m] = measure(s[idx], y(rows)[idx], out["threshold"])
+        key = "model" if split == "test" else "task_type"
+        bucket = out["by_model"] if split == "test" else out["by_task"]
+        for v in sorted({r["meta"][key] for r in rows}):
+            idx = [i for i, r in enumerate(rows) if r["meta"][key] == v]
+            bucket[v] = measure(s[idx], y(rows)[idx], out["threshold"])
 
     SCORES.mkdir(parents=True, exist_ok=True)
-    (SCORES / f"{name}.json").write_text(json.dumps(out, indent=2))
+    (SCORES / f"{name}.json").write_text(json.dumps(out))
     print(f"{name}: threshold {out['threshold']:.4f}")
     for split, m in out["splits"].items():
         print(f"  {split:9s} n={m['n']:5d}  AUROC {m['auroc']:.4f}  "
@@ -144,28 +217,69 @@ def run(name):
     return out
 
 
+# ---------------------------------------------------------------- report
+
+
 def report():
-    rows = []
-    for name in CANDIDATES:
-        f = SCORES / f"{name}.json"
-        if f.exists():
-            rows.append((name, json.loads(f.read_text())))
-    if not rows:
+    saved = [(n, json.loads((SCORES / f"{n}.json").read_text()))
+             for n in CANDIDATES if (SCORES / f"{n}.json").exists()]
+    if not saved:
         sys.exit("nothing scored yet")
+    test, transfer = load("test"), load("transfer")
+    yt, yx = y(test), y(transfer)
+    src = [r["meta"]["source_id"] for r in test]
+    nan = float("nan")
 
-    print("\n| Candidate | test AUROC | test recall @ dev FPR<=5% | realized test FPR | transfer AUROC |")
+    def cell(d, split, field):
+        return d["splits"].get(split, {}).get(field, nan)
+
+    print("\n### Main\n")
+    print("| Candidate | test AUROC | test AUROC 95% CI | test recall | test FPR | "
+          "transfer AUROC | transfer recall | transfer FPR |")
+    print("|---|---|---|---|---|---|---|---|")
+    for n, d in saved:
+        lo, hi = boot_auroc_ci(yt, np.array(d["scores"]["test"]), src)
+        print(f"| `{n}` | {cell(d,'test','auroc'):.3f} | {lo:.3f}–{hi:.3f} | "
+              f"{cell(d,'test','recall'):.3f} | {cell(d,'test','fpr'):.3f} | "
+              f"{cell(d,'transfer','auroc'):.3f} | {cell(d,'transfer','recall'):.3f} | "
+              f"{cell(d,'transfer','fpr'):.3f} |")
+
+    models = sorted({m for _, d in saved for m in d["by_model"]})
+    print("\n### Test AUROC by writer model (n≈150 each; 95% CI is roughly ±0.11)\n")
+    print("| Candidate | " + " | ".join(m.replace("-0613", "") for m in models) + " | mean |")
+    print("|---" * (len(models) + 2) + "|")
+    for n, d in saved:
+        vals = [d["by_model"].get(m, {}).get("auroc", nan) for m in models]
+        print(f"| `{n}` | " + " | ".join(f"{v:.3f}" for v in vals) +
+              f" | **{np.nanmean(vals):.3f}** |")
+
+    tasks = sorted({t for _, d in saved for t in d["by_task"]})
+    if tasks:
+        print("\n### Transfer AUROC by task type\n")
+        print("| Candidate | " + " | ".join(tasks) + " |")
+        print("|---" * (len(tasks) + 1) + "|")
+        for n, d in saved:
+            print(f"| `{n}` | " + " | ".join(
+                f"{d['by_task'].get(t, {}).get('auroc', nan):.3f}" for t in tasks) + " |")
+
+    # The bars: every comparison is a paired interval, never two point estimates.
+    have = dict(saved)
+    floor = max(("answer-only", "writer-prior"),
+                key=lambda k: have[k]["splits"]["test"]["auroc"] if k in have else -1)
+    print(f"\n### Deltas (paired cluster bootstrap, {BOOTSTRAP} resamples)\n")
+    print("| Comparison | split | ΔAUROC | 95% CI | excludes 0 |")
     print("|---|---|---|---|---|")
-    for name, d in rows:
-        t, x = d["splits"]["test"], d["splits"].get("transfer", {})
-        print(f"| `{name}` | {t['auroc']:.3f} | {t['recall']:.3f} | {t['fpr']:.3f} | "
-              f"{x.get('auroc', float('nan')):.3f} |")
-
-    print("\nPer writer model, test AUROC:\n")
-    models = sorted(rows[0][1]["by_model"])
-    print("| Candidate | " + " | ".join(m.replace("-0613", "") for m in models) + " |")
-    print("|---" * (len(models) + 1) + "|")
-    for name, d in rows:
-        print(f"| `{name}` | " + " | ".join(f"{d['by_model'][m]['auroc']:.3f}" for m in models) + " |")
+    pairs = [(floor, "gemma-ft", "test"), ("gemma", "gemma-ft", "test"),
+             (floor, "gemma-ft", "transfer"), ("gemma", "gemma-ft", "transfer")]
+    for a, b, split in pairs:
+        if a not in have or b not in have:
+            continue
+        labels, groups = (yt, src) if split == "test" else (yx, list(range(len(transfer))))
+        sa, sb = np.array(have[a]["scores"][split]), np.array(have[b]["scores"][split])
+        lo, hi = boot_delta_ci(labels, sa, sb, groups)
+        d = roc_auc_score(labels, sb) - roc_auc_score(labels, sa)
+        print(f"| `{b}` − `{a}` | {split} | {d:+.3f} | {lo:+.3f}–{hi:+.3f} | "
+              f"{'**yes**' if lo > 0 else 'no'} |")
 
 
 if __name__ == "__main__":
