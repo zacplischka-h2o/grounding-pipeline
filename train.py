@@ -138,9 +138,13 @@ def build_dataset(tok):
 
 
 def main():
-    from trl import SFTConfig, SFTTrainer
+    # unsloth MUST import before trl/transformers/peft — it patches them on import,
+    # and a wrong order silently loses the memory optimizations. Not module scope:
+    # evaluate.py imports this file to reach first_token_scores, and runs its
+    # model-free candidates on machines with no unsloth and no GPU.
     from unsloth import FastModel
     from unsloth.chat_templates import train_on_responses_only
+    from trl import SFTConfig, SFTTrainer
 
     model, tok = _load()
     model = FastModel.get_peft_model(
