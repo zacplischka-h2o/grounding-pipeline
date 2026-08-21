@@ -76,7 +76,7 @@ def _prompt_text(tok, prompt):
     ))
 
 
-def first_token_scores(prompts, adapter=None, batch_size=16):
+def first_token_scores(prompts, adapter=None):
     """P(ungrounded) at the first generated position, for each prompt.
 
     A real two-way distribution: no sampling, no generation. Returns the normalized
@@ -117,34 +117,33 @@ def first_token_scores(prompts, adapter=None, batch_size=16):
         f"would be biased by which word happens to have more spellings."
     )
 
+    # One row at a time, deliberately. Two reasons, both measured:
+    #  * Padding put the readout on a pad slot. Batched rows returned
+    #    P(grounded)+P(ungrounded) = 1.1e-07 where the same rows scored 1.00 alone.
+    #    With no padding there is no ambiguity about which position to read.
+    #  * Gemma 4's vocabulary is ~262k, so logits over a padded batch of 16 x ~1.4k
+    #    tokens is a 12 GB tensor and OOMs a 40 GB A100. `logits_to_keep=1` computes
+    #    the LM head at the final position only.
+    # A single 2.3B forward pass is fast; the whole eval is minutes, not hours.
     out = []
-    texts = [_prompt_text(tok, p) for p in prompts]
-    tk.padding_side = "right"
-    for i in range(0, len(texts), batch_size):
-        batch = tk(texts[i : i + batch_size], return_tensors="pt", padding=True,
-                   truncation=True, max_length=MAX_SEQ).to(model.device)
+    for n, p in enumerate(prompts):
+        enc = tk(_prompt_text(tok, p), return_tensors="pt", truncation=True,
+                 max_length=MAX_SEQ).to(model.device)
         with torch.no_grad():
-            # Select each row's LAST REAL token via the attention mask. Reading
-            # logits[:, -1, :] assumes left padding, and a `padding_side` kwarg on the
-            # tokenizer call is not honoured here — measured: batched rows returned
-            # P(grounded)+P(ungrounded) = 1.1e-07 (a pad slot) where the same rows
-            # scored 1.00 unbatched. Gathering by mask is correct under either side.
-            last = batch["attention_mask"].sum(1) - 1
-            all_logits = model(**batch).logits
-            logits = all_logits[torch.arange(all_logits.shape[0]), last].float()
+            logits = model(**enc, logits_to_keep=1).logits[0, -1].float()
         probs = torch.softmax(logits, dim=-1)
-        pg = probs[:, g_ids].sum(-1)
-        pu = probs[:, u_ids].sum(-1)
+        pg = float(probs[g_ids].sum())
+        pu = float(probs[u_ids].sum())
         # A dead two-way distribution divided by a clamp yields a well-behaved number
-        # in [0,1] that is pure logit noise, and reads as "weak model" not "broken
-        # readout". Stop instead. Checked on every batch: a degenerate minority is
-        # invisible in a batch mean.
-        assert float((pg + pu).min()) > 1e-4, (
-            f"readout dead on a row in batch {i // batch_size}: "
-            f"P(grounded)+P(ungrounded) = {float((pg + pu).min()):.2e}. "
+        # in [0,1] that is pure logit noise, and reads as "weak model" rather than
+        # "broken readout". Stop instead.
+        assert pg + pu > 1e-4, (
+            f"readout dead on row {n}: P(grounded)+P(ungrounded) = {pg + pu:.2e}. "
             "The prompt was truncated, or the model is not answering with one word."
         )
-        out.extend((pu / (pg + pu)).cpu().tolist())
+        out.append(pu / (pg + pu))
+        if n % 500 == 0:
+            print(f"  scored {n}/{len(prompts)}", flush=True)
     return np.array(out)
 
 
