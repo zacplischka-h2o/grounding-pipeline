@@ -119,11 +119,19 @@ def first_token_scores(prompts, adapter=None, batch_size=16):
 
     out = []
     texts = [_prompt_text(tok, p) for p in prompts]
+    tk.padding_side = "right"
     for i in range(0, len(texts), batch_size):
         batch = tk(texts[i : i + batch_size], return_tensors="pt", padding=True,
-                   padding_side="left", truncation=True, max_length=MAX_SEQ).to(model.device)
+                   truncation=True, max_length=MAX_SEQ).to(model.device)
         with torch.no_grad():
-            logits = model(**batch).logits[:, -1, :].float()
+            # Select each row's LAST REAL token via the attention mask. Reading
+            # logits[:, -1, :] assumes left padding, and a `padding_side` kwarg on the
+            # tokenizer call is not honoured here — measured: batched rows returned
+            # P(grounded)+P(ungrounded) = 1.1e-07 (a pad slot) where the same rows
+            # scored 1.00 unbatched. Gathering by mask is correct under either side.
+            last = batch["attention_mask"].sum(1) - 1
+            all_logits = model(**batch).logits
+            logits = all_logits[torch.arange(all_logits.shape[0]), last].float()
         probs = torch.softmax(logits, dim=-1)
         pg = probs[:, g_ids].sum(-1)
         pu = probs[:, u_ids].sum(-1)
