@@ -1,13 +1,17 @@
 """LoRA fine-tune Gemma 4 E2B as a groundedness Classifier, and score with it.
 
 Needs a CUDA GPU. See docs/adr/0003-train-on-unsloth-not-local-mlx.md for why this is
-not local MLX. Tuned for an A100: bf16 weights, real batches. On a T4 or any GPU under
-~24GB, set LOAD_IN_4BIT = True and per_device_train_batch_size = 1 (accumulation 16).
+not local MLX. Tuned for an A100.
 
     pip install unsloth
-    python train.py                 # train, save adapter to models/gemma-ft
-    python evaluate.py gemma        # off-the-shelf
-    python evaluate.py gemma-ft     # + adapter
+
+    # Run 1 — bf16 base, 1,000 rows (the published result)
+    python train.py
+    python evaluate.py gemma && python evaluate.py gemma-ft
+
+    # Run 2 — 4-bit base, full training set
+    LOAD_IN_4BIT=1 TRAIN_ROWS=4335 ADAPTER=models/gemma-ft-4bit python train.py
+    python evaluate.py gemma-4bit && python evaluate.py gemma-ft-4bit
 
 evaluate.py imports first_token_scores from here so that both rows are produced by
 one loading path. The adapter is never merged: merging shifts the first-token logit
@@ -15,19 +19,20 @@ ratio, which is the readout.
 """
 
 import json
+import os
 import random
 from pathlib import Path
 
 # One id for training and for both eval rows. The adapter is never merged.
 MODEL_ID = "unsloth/gemma-4-E2B-it"
-# bf16, not 4-bit: an A100 has the memory and the hardware bf16 path, so there is no
-# reason to eat quantization loss. What matters is that training and BOTH eval rows
-# use the same setting — a mismatch would put part of the measured lift in the
-# weights rather than the fine-tune. Set True if running on a smaller GPU.
-LOAD_IN_4BIT = False
+# What matters is that training and BOTH eval rows use the same setting — a mismatch
+# would put part of the measured lift in the weights rather than the fine-tune. The
+# bf16 run is the published one; the 4-bit run is a separate experiment with its own
+# adapter and its own two eval rows, so the pair is always self-consistent.
+LOAD_IN_4BIT = os.environ.get("LOAD_IN_4BIT") == "1"
 MAX_SEQ = 8192  # 128K-context model; a lower cap only risks silent truncation
-ADAPTER = Path("models/gemma-ft")
-TRAIN_ROWS = 1000
+ADAPTER = Path(os.environ.get("ADAPTER", "models/gemma-ft"))
+TRAIN_ROWS = int(os.environ.get("TRAIN_ROWS", "1000"))
 SEED = 3407
 
 _MODEL = _TOK = _ADAPTER_LOADED = None

@@ -169,13 +169,19 @@ def score_judge(train, rows):
     return np.array([0.5 if v != v else v for v in scores])
 
 
-def score_gemma(train, rows, adapter=None):
-    """P(ungrounded) from the first generated token. See train.py for the recipe."""
+def score_gemma(train, rows, adapter=None, four_bit=False):
+    """P(ungrounded) from the first generated token. See train.py for the recipe.
+
+    `four_bit` must match how the adapter was trained. It is set before the first
+    call, and `_load` caches per process, so the base weights cannot drift between
+    the two rows of a pair.
+    """
     del train
     from prep import render
-    from train import first_token_scores
+    import train as t
 
-    return first_token_scores([render(r) for r in rows], adapter=adapter)
+    t.LOAD_IN_4BIT = four_bit
+    return t.first_token_scores([render(r) for r in rows], adapter=adapter)
 
 
 # Candidates that emit a Verdict, not a score: threshold is 0.5 and dev is not scored.
@@ -188,6 +194,12 @@ CANDIDATES = {
     "judge": score_judge,
     "gemma": score_gemma,
     "gemma-ft": lambda tr, rows: score_gemma(tr, rows, adapter="models/gemma-ft"),
+    # Second experiment: 4-bit base, full 4,335-row training set. Both rows are
+    # re-scored on the 4-bit base so the delta measures the fine-tune, not the
+    # quantization.
+    "gemma-4bit": lambda tr, rows: score_gemma(tr, rows, four_bit=True),
+    "gemma-ft-4bit": lambda tr, rows: score_gemma(
+        tr, rows, adapter="models/gemma-ft-4bit", four_bit=True),
 }
 
 # ---------------------------------------------------------------- metrics
@@ -337,7 +349,13 @@ def report():
     print("| Comparison | split | ΔAUROC | 95% CI | excludes 0 |")
     print("|---|---|---|---|---|")
     pairs = [(floor, "gemma-ft", "test"), ("gemma", "gemma-ft", "test"),
-             (floor, "gemma-ft", "transfer"), ("gemma", "gemma-ft", "transfer")]
+             (floor, "gemma-ft", "transfer"), ("gemma", "gemma-ft", "transfer"),
+             (floor, "gemma-ft-4bit", "test"),
+             ("gemma-4bit", "gemma-ft-4bit", "test"),
+             ("gemma-ft", "gemma-ft-4bit", "test"),
+             (floor, "gemma-ft-4bit", "transfer"),
+             ("gemma-4bit", "gemma-ft-4bit", "transfer"),
+             ("gemma-ft", "gemma-ft-4bit", "transfer")]
     for a, b, split in pairs:
         if a not in have or b not in have:
             continue
@@ -347,6 +365,24 @@ def report():
         d = roc_auc_score(labels, sb) - roc_auc_score(labels, sa)
         print(f"| `{b}` − `{a}` | {split} | {d:+.3f} | {lo:+.3f}–{hi:+.3f} | "
               f"{'**yes**' if lo > 0 else 'no'} |")
+
+    # ADR 0009 question 1 is about one slice only: the careful writers, where the
+    # bf16 run scored barely above chance. A pooled delta would hide it.
+    careful = [i for i, r in enumerate(test) if r["meta"]["model"].startswith("gpt")]
+    if careful and "gemma-ft" in have and "gemma-ft-4bit" in have:
+        print("\n### The careful-writer slice (gpt-3.5 + gpt-4), paired\n")
+        print("| Comparison | n | ΔAUROC | 95% CI | excludes 0 |")
+        print("|---|---|---|---|---|")
+        yc, gc = yt[careful], [src[i] for i in careful]
+        for a, b in [("gemma-ft", "gemma-ft-4bit"), ("gemma-4bit", "gemma-ft-4bit")]:
+            if a not in have:
+                continue
+            sa = np.array(have[a]["scores"]["test"])[careful]
+            sb = np.array(have[b]["scores"]["test"])[careful]
+            lo, hi = boot_delta_ci(yc, sa, sb, gc)
+            d = roc_auc_score(yc, sb) - roc_auc_score(yc, sa)
+            print(f"| `{b}` − `{a}` | {len(careful)} | {d:+.3f} | {lo:+.3f}–{hi:+.3f} | "
+                  f"{'**yes**' if lo > 0 else 'no'} |")
 
 
 if __name__ == "__main__":
