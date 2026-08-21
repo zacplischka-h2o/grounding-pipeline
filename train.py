@@ -90,22 +90,31 @@ def first_token_scores(prompts, adapter=None, batch_size=16):
     model.eval()
 
     def variants(word):
+        """First token of the label, and of its capitalized form. Nothing else.
+
+        Neither label is a single token under Gemma 4 — 'grounded' splits as
+        ['ground','ed'] and 'ungrounded' as ['ung','rounded'] — but their FIRST tokens
+        differ, which is all the readout needs. Space-prefixed forms are deliberately
+        excluded: ' ungrounded' begins with ' un', which would also collect
+        ' unfortunately', ' unclear', ' unsupported'. The chat template puts the answer
+        straight after a newline, so no leading space arises. Both sets are the same
+        size, so the ratio is not biased by uneven coverage.
+        """
         ids = set()
-        for form in (word, word.capitalize(), " " + word, " " + word.capitalize()):
+        for form in (word, word.capitalize()):
             t = tk.encode(form, add_special_tokens=False)
             if t:
                 ids.add(t[0])
         return sorted(ids)
 
-    for w in ("grounded", "ungrounded"):
-        assert len(tk.encode(w, add_special_tokens=False)) == 1, (
-            f"{w!r} is not a single token under this tokenizer. If 'ungrounded' splits "
-            f"as 'un' + 'grounded', its first-token mass absorbs every word starting "
-            f"'un' — 'Unfortunately', 'Unless', 'Under' — and the readout is noise."
-        )
     g_ids, u_ids = variants("grounded"), variants("ungrounded")
     assert not (set(g_ids) & set(u_ids)), (
-        "'grounded' and 'ungrounded' share a first token under this tokenizer"
+        f"'grounded' {g_ids} and 'ungrounded' {u_ids} share a first token under this "
+        f"tokenizer; the readout cannot separate them"
+    )
+    assert len(g_ids) == len(u_ids), (
+        f"asymmetric label coverage: {len(g_ids)} vs {len(u_ids)} token ids. The ratio "
+        f"would be biased by which word happens to have more spellings."
     )
 
     out = []
