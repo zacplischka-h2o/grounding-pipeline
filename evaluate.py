@@ -32,7 +32,7 @@ DATA = Path("data")
 SCORES = Path("data/scores")
 TARGET_FPR = 0.05
 JUDGE_MODEL = "claude-opus-5"
-JUDGE_WORKERS = 12
+JUDGE_WORKERS = 24
 BOOTSTRAP = 2000
 SEED = 17
 

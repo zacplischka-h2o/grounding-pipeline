@@ -91,10 +91,10 @@ repeat.
 2. `evaluate.py script` — the deterministic floor. **Done: test AUROC 0.588.**
 3. `evaluate.py writer-prior` — the identity floor. **Done: test AUROC 0.828, transfer 0.695.**
 4. `evaluate.py answer-only` — the shortcut floor. **Done: test AUROC 0.835, transfer 0.522.**
-5. `evaluate.py gemma` on 20 dev rows as a go/no-go, before renting a GPU for the full run.
-6. `train.py` — LoRA, 1,000 rows, on Colab. **Pending.**
-7. `evaluate.py gemma` and `evaluate.py gemma-ft`, full splits. **Pending.**
-8. `evaluate.py report` → paste into `report.md`. **Pending.**
+5. `evaluate.py judge` — the incumbent LLM judge. **Done: test 0.849, transfer 0.836.**
+6. `train.py` — LoRA, 1,000 rows, A100. **Done: 9.5 min.**
+7. `evaluate.py gemma` / `gemma-ft`. **Done: 0.706 -> 0.863 test.**
+8. `evaluate.py report` -> `report.md`. **Done. All four bars pass.**
 
 ## Files
 
