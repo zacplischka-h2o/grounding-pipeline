@@ -51,10 +51,23 @@ def _load(adapter=None):
     return model, tok
 
 
+def _tok(tok):
+    """Resolve the text tokenizer.
+
+    Gemma 4 is multimodal, so FastModel returns a `Gemma4Processor` — a wrapper that
+    has `apply_chat_template` and `decode` but NOT `encode`, and does not proxy
+    attribute access. The text tokenizer sits at `.tokenizer`. Everything that
+    tokenizes or reads a special token goes through here, so training and eval cannot
+    diverge on which one they used.
+    """
+    return getattr(tok, "tokenizer", tok)
+
+
 def _strip_bos(tok, text):
     """apply_chat_template emits <bos>; the tokenizer adds another. Unsloth's Gemma 4
     guide says to remove it."""
-    return text.removeprefix(tok.bos_token) if tok.bos_token else text
+    bos = getattr(_tok(tok), "bos_token", None)
+    return text.removeprefix(bos) if bos else text
 
 
 def _prompt_text(tok, prompt):
@@ -73,18 +86,19 @@ def first_token_scores(prompts, adapter=None, batch_size=16):
     import torch
 
     model, tok = _load(adapter)
+    tk = _tok(tok)
     model.eval()
 
     def variants(word):
         ids = set()
         for form in (word, word.capitalize(), " " + word, " " + word.capitalize()):
-            t = tok.encode(form, add_special_tokens=False)
+            t = tk.encode(form, add_special_tokens=False)
             if t:
                 ids.add(t[0])
         return sorted(ids)
 
     for w in ("grounded", "ungrounded"):
-        assert len(tok.encode(w, add_special_tokens=False)) == 1, (
+        assert len(tk.encode(w, add_special_tokens=False)) == 1, (
             f"{w!r} is not a single token under this tokenizer. If 'ungrounded' splits "
             f"as 'un' + 'grounded', its first-token mass absorbs every word starting "
             f"'un' — 'Unfortunately', 'Unless', 'Under' — and the readout is noise."
@@ -97,8 +111,8 @@ def first_token_scores(prompts, adapter=None, batch_size=16):
     out = []
     texts = [_prompt_text(tok, p) for p in prompts]
     for i in range(0, len(texts), batch_size):
-        batch = tok(texts[i : i + batch_size], return_tensors="pt", padding=True,
-                    padding_side="left", truncation=True, max_length=MAX_SEQ).to(model.device)
+        batch = tk(texts[i : i + batch_size], return_tensors="pt", padding=True,
+                   padding_side="left", truncation=True, max_length=MAX_SEQ).to(model.device)
         with torch.no_grad():
             logits = model(**batch).logits[:, -1, :].float()
         probs = torch.softmax(logits, dim=-1)
@@ -134,6 +148,9 @@ def build_dataset(tok):
     ]
     print(f"training rows: {len(texts)}  "
           f"ungrounded {sum(r['label'] == 'ungrounded' for r in rows) / len(rows):.3f}")
+    # The prompt is load-bearing and must match eval byte for byte. Show its head so a
+    # stray <bos> or a changed template is visible in the log.
+    print(f"training text head: {texts[0][:60]!r}")
     return Dataset.from_dict({"text": texts})
 
 
@@ -199,7 +216,8 @@ def main():
     longest = max(range(len(ds)), key=lambda i: len(ds[i]["input_ids"]))
     for tag, i in [("row 0", 0), ("longest row", longest)]:
         row = ds[i]
-        kept = tok.decode([t for t, l in zip(row["input_ids"], row["labels"]) if l != -100])
+        kept = _tok(tok).decode(
+            [t for t, l in zip(row["input_ids"], row["labels"]) if l != -100])
         print(f"supervised tokens of {tag} ({len(row['input_ids'])} tok): {kept!r}")
         assert "grounded" in kept and len(kept) < 40, (
             f"completion-only masking is wrong on {tag}; supervising "
